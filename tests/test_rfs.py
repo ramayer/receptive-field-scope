@@ -51,6 +51,7 @@ def test_real_input_accepted():
     assert r.left + r.right == 8 + 2 * 8 * 2 + 2
 
 
+@pytest.mark.slow
 def test_perturbation_agrees_with_gradient_on_conv():
     m = ConvTokenizer(3).eval()
     g = measure_receptive_field(m, (1, 3, 256, 256))[0]
@@ -66,6 +67,7 @@ def test_layerwise_hops():
     assert [r["hop"] for r in rows[1:]] == [1.0, 1.0]
 
 
+@pytest.mark.slow
 def test_position_map_shows_border_effect():
     m = ConvTokenizer(2).eval()
     pm = position_map(m, (1, 3, 128, 128), step=2)

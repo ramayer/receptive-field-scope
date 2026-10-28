@@ -4,20 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "receptive-field-scope"
-version = "0.1.0"
-description = "Measure receptive fields of arbitrary PyTorch encoders/decoders (gradient- and perturbation-based, support vs effective, per-direction, per-layer, alignment sweeps, tiling-margin validation)."
+version = "0.2.0"
+description = "Measure receptive fields of arbitrary PyTorch encoders/decoders (images, audio and video; gradient- and perturbation-based, support vs effective, per-direction, per-layer, alignment sweeps, tiling-margin validation)."
 readme = "README.md"
 license = "CC0-1.0"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.1"]
-keywords = ["receptive field", "effective receptive field", "autoencoder", "tokenizer", "vision transformer", "tiling", "pytorch"]
+keywords = ["audio", "HuBERT", "receptive field", "effective receptive field", "autoencoder", "tokenizer", "vision transformer", "tiling", "pytorch"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
-examples = ["compressai", "torchvision", "matplotlib"]
+examples = ["compressai", "torchvision", "matplotlib", "transformers", "jupyter"]
+plots = ["matplotlib"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: slower tests (perturbation sweeps, position maps)"]
