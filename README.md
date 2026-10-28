@@ -1,48 +1,50 @@
 # receptive_field_scope
 
-Measure the receptive field of **any** PyTorch encoder/decoder (any `tensor -> tensor` callable), with a focus on
-tokenizers/autoencoders, windowed or haloed attention, strided/patchified stems, and tiled inference.
+Measure the receptive field of **any** PyTorch model (any `tensor -> tensor` callable) in **1D (audio), 2D (images, spectrograms) or 3D (video)**, with a focus on
+tokenizers/autoencoders, windowed or haloed attention, strided/patchified stems, speech encoders (HuBERT/wav2vec2 style), and tiled/chunked inference.
+"scope" as in the *scope* of the receptive field, and as in a telescope you point at it.
 
-Status: **v0.1 draft** (written to bootstrap a project; see [Roadmap](#roadmap)).
+Status: **v0.2 draft** (written to bootstrap a project; see [Roadmap](#roadmap)). Tests: 25 pass (`pytest`; ~2 min, `-m "not slow"` is faster).
 
 ## Why
 
-"How far does one latent token see?" is a surprisingly slippery question:
+"How far does one latent token / one audio frame see?" is a surprisingly slippery question:
 
 * Formula-based counts break the moment a model has blocked attention, zero-init residual gates, odd stems, or
-  non-truncating leakage. (The tool in this repo exists because a hand-derived formula was wrong twice.)
+  non-truncating leakage. (This tool exists because a hand-derived formula was wrong twice.)
 * The **structural support** (what *can* influence an output) and the **effective receptive field** (what *does*,
-  by gradient energy) can differ by 3x or more, and the answer to "does the receptive field matter?" is usually in
-  the gap between them.
+  by gradient mass) can differ by 3x or more, and the answer to "does the receptive field matter?" is usually in the gap between them.
 * Strided and blocked models are **alignment-dependent**: reach differs by which cell inside a block/stride you probe,
   and is often asymmetric left/right.
-* What you usually want in the end is practical: *what tile margin reproduces the full-image result?*
+* What you usually want in the end is practical: *what tile/chunk margin reproduces the full-input result?*
 
 ## Install
 
 ```bash
-pip install -e .            # needs torch
-pip install -e ".[dev]"     # + pytest
-pip install -e ".[examples]"  # + compressai, torchvision, matplotlib
-pytest
+pip install -e .                 # needs torch
+pip install -e ".[dev]"          # + pytest
+pip install -e ".[examples]"     # + compressai, torchvision, matplotlib, transformers, jupyter
+pytest                           # or: pytest -m "not slow"
 ```
 
 ## Quickstart
 
 ```python
 import torch
-from receptive_field_scope import (measure_receptive_field, sweep_centers, summarize, activate_gates,
+from receptive_field_scope import (measure_receptive_field, sweep_centers, summarize, activate_gates, channels_last,
                                    layerwise_receptive_field, print_layerwise, margin_sweep, print_margin_sweep)
+from receptive_field_scope.plotting import overlay_heatmap, plot_waveform_rf
 
-enc = my_encoder.eval()                                    # any callable [1,C,H,W] -> [1,C',h,w]
+enc = my_encoder.eval()                                    # any callable [1,C,*S] -> [1,C',*s]
 
 # one centre, random-noise probe (fine for structural support of local models)
 r = measure_receptive_field(enc, (1, 3, 512, 512))[0]
 print(r.left, r.right, r.up, r.down, r.eff_radius, r.touches_border, r.is_global)
 
-# sweep every offset inside one 4x4-token block, with a REAL image (use this for trained, data-dependent attention)
-rs = measure_receptive_field(enc, input=image, centers=sweep_centers((64, 64), period=4))
+# a REAL image (needed for trained, data-dependent attention) + every offset inside one 4x4-token block
+rs = measure_receptive_field(enc, input=image, centers=sweep_centers((64, 64), period=4), keep_maps=True)
 summarize(rs, "encoder")
+overlay_heatmap(image, rs[0])                              # heatmap over the image, support box + effective circle
 
 # models with zero-init residual gates: open them to see the structural worst case
 with activate_gates(model):
@@ -54,65 +56,95 @@ measure_receptive_field(model.decoder, (1, 32, 64, 64), scale=patch_size)
 # where does the reach come from?  per-layer hops
 print_layerwise(layerwise_receptive_field(enc, (1, 3, 512, 512)))
 
-# the practical question: which tile margin reproduces full-image output?
-print_margin_sweep(margin_sweep(enc, [image], tile=64, margins=[0, 16, 32, 64, 96], discrete=False))
+# the practical question: which tile margin reproduces the full-image output?
+print_margin_sweep(margin_sweep(enc, [image], tile=64, margins=[0, 16, 32, 64, 96]))
 ```
+
+### Audio (1D)
+
+```python
+from transformers import HubertModel
+from receptive_field_scope import hf_audio_layer
+
+model = HubertModel.from_pretrained(...).eval()            # or an AVES checkpoint converted to HubertModel
+wave = torch.randn(1, 1, 16000)                            # [1, 1, samples]; use real clips for effective RFs
+ms = 1000 / 16000                                          # scale: samples -> milliseconds
+
+measure_receptive_field(hf_audio_layer(model, extractor_only=True), input=wave, eps=1e-12, scale=ms)   # conv extractor: 25 ms
+measure_receptive_field(hf_audio_layer(model, layer=6), input=wave, power=2, scale=ms)                 # transformer layer 6
+```
+
+Models whose forward returns `[B, T, C]` (most transformer stacks) need `channels_last(fn)`; models taking `[B, T]` waveforms need
+`waveform_model(fn)`. `hf_audio_layer` does both for Hugging Face wav2vec2/HuBERT-style models. For torchaudio/fairseq-format models
+(AVES is, as far as we know, distributed in a torchaudio-compatible format) write the same few-line wrapper yourself; this has not been tested here.
 
 ## What is measured
 
 | quantity | meaning | use it for |
 |---|---|---|
-| `left/right/up/down` | **support**: farthest input cell with `|grad| > eps * max`, from the output cell's centre to the outer cell edge | tile margins; strictly local models have *exactly zero* gradient outside it |
-| `radius` | `max(left,right,up,down)` | worst-case one-sided reach |
-| `eff_left/...`, `eff_radius` | **effective**: central interval / disk holding `energy` (default 95%) of the gradient mass (Luo et al. 2016) | "does the long-range path matter?"; models that leak everywhere |
-| `asymmetry` | `|left-right|`, `|up-down|` | alignment (block/stride) dependence |
+| `lo`, `hi` (per axis); `left/right/up/down` views | **support**: farthest input cell with `|grad| > eps * max`, from the output cell's centre to the outer cell edge | tile/chunk margins; strictly local models have *exactly zero* gradient outside it |
+| `radius`, `width`, `asymmetry` | max one-sided reach; `lo+hi` per axis (x/time first); `|lo-hi|` per axis | worst-case reach; alignment (block/stride) dependence |
+| `eff_lo/eff_hi`, `eff_radius` | **effective**: central interval / radial radius holding `energy` (default 95%) of the gradient mass (Luo et al. 2016) | "does the long-range path matter?"; models that leak everywhere |
 | `touches_border` | support reached the input edge | numbers are lower bounds, use a bigger input |
-| `is_global` | support spans >= 90% of the input | global attention / GroupNorm / pooling |
+| `is_global` | support spans >= 90% of the input on some axis | global attention / GroupNorm / pooling |
 
-Conventions: distances are in **input-grid cells x `scale`**, from the **centre of the output cell** to the **outer edge of
-the farthest cell**, so `left + right` is the support width. `centers` are output-grid cells; `sweep_centers(out_hw, period)`
-enumerates every offset in one block.
+Conventions: distances are in **input-grid cells x `scale`** (`scale` may be one number or one per axis), from the **centre of the output cell** to the
+**outer edge of the farthest cell**, so `lo + hi` is the support width. `centers` are output-grid cells (`(y, x)` in 2D, `(t,)` or an int in 1D);
+`sweep_centers(out_shape, period)` enumerates every offset in one block.
 
-Gradients use several random channel projections of the output vector (so LayerNorm-style cancellations of a plain
-channel sum cannot hide paths) and a random-normal input unless you pass `input=`.
+Gradients use several random channel projections of the output vector (so LayerNorm-style cancellations of a plain channel sum cannot hide paths)
+and a random-normal input unless you pass `input=`.
+
+### L1 mass vs squared energy (`power`)
+
+The effective radius is computed from `|grad|**power`. `power=1` (default; Luo et al.'s magnitude) lets **diffuse tails add up**; `power=2` (squared, "energy")
+suppresses them. For local models the two agree; for models with weak global leakage they do not. Example from the tests: a wav2vec2-style conv extractor with
+GroupNorm over time (global support) has an effective radius of ~5250 samples at `power=1` but ~270 samples (17 ms) at `power=2`. For leaky models report both.
 
 ### Perturbation-based variant
 
-`perturbation_receptive_field(fn, ...)` adds noise to one input patch at a time and watches one output cell. It needs no
-gradients, so it works through quantizers, argmax and black-box models; it is coarser and slower
-(use `window=` to restrict the probed area).
+`perturbation_receptive_field(fn, ...)` adds noise to one input patch at a time and watches one output cell. It needs no gradients, so it works through
+quantizers, argmax and black-box models; it is coarser and slower (use `window=` to restrict the probed area).
 
-## Example: an off-the-shelf encoder (CompressAI `g_a`, random init)
+## Demos
 
-`python examples/compressai_encoder.py` (output from this repo's first run):
+* `notebooks/receptive_field_demo.ipynb` (executed, outputs included): heatmaps of the receptive field overlaid on an image for a local-conv, a blocked-mixing
+  (haloed-attention-like) and a global-attention toy tokenizer; block-alignment asymmetry; image dependence; per-layer hops; tile-margin sweep; a waveform.
+* `examples/compressai_encoder.py`: off-the-shelf encoder (CompressAI `g_a`, random init).
+* `examples/hubert_receptive_field.py`: Hugging Face HuBERT (random init): conv extractor = 400 samples/25 ms at stride 320; global support above it.
+
+CompressAI `g_a` (random init), alignment sweep, input pixels:
 
 ```
-== g_a (4 centres) ==                  # alignment sweep, support in input pixels
-  left   38.0   right 23.0   up 38.0   down 23.0     <- strided 5x5 convs: asymmetric reach, same on every offset
-per layer: radius 3 -> 8 -> 18 -> 38 (hops 3, 5, 10, 20 as stride doubles)
+left 38 right 23 up 38 down 23     <- strided 5x5 convs: asymmetric reach, same on every offset
+per layer: radius 3 -> 8 -> 18 -> 38
 margin(px)  frac differing
          0        0.806742
         16        0.338704
         32        0.000000       <- margin >= support radius - half a cell (38 - 8 = 30) reproduces the full encode
 ```
 
-Practical rule of thumb used by `tiled_apply`/`margin_sweep`: the needed margin is about
-`support radius - half an output cell`, rounded up to a multiple of whatever alignment the model needs (block size x
-stride). Always confirm with `margin_sweep` on real images.
+HuBERT-style conv extractor (16 kHz): per-layer support widths 10, 20, 40, 80, 160, 240, **400 samples**; stride 320. The tests check this against a real
+`transformers.HubertModel`, and also show that the **`group` feature-extractor norm variant (wav2vec2-base/HuBERT-base style) makes the conv extractor globally dependent
+on the clip** (weakly: tiny at `power=2`), while the `layer` norm variant is exactly 400 samples. That matters for chunked inference: chunk outputs will not
+exactly match full-clip outputs for `group`-norm models even with generous margins.
 
 ## Caveats (read these)
 
-* The default probe is **random noise**. For trained models with data-dependent attention, pass real images
-  (`input=`) and compare several (`over_images`); effective radius can differ a lot between images.
-* The support threshold `eps` is relative to the peak gradient. For strictly local models it hardly matters (gradient is
-  exactly zero outside the support); for models with soft tails it does. Report the `eps` you used.
-* Zero-init gates (LayerScale/ReZero) make a fresh model look conv-only. Use `activate_gates` to see the structural
-  worst case, and measure trained models without it to see what training actually opened.
+* The default probe is **random noise**. For trained models with data-dependent attention, pass real inputs (`input=`) and compare several (`over_images` / `over_clips`);
+  effective radius can differ a lot between inputs.
+* The support threshold `eps` is relative to the peak gradient. For strictly local models it hardly matters (gradient is exactly zero outside the support, so
+  `eps=1e-12` is safe); for models with soft tails it does. Report the `eps` and `power` you used.
+* Zero-init gates (LayerScale/ReZero) make a fresh model look conv-only. Use `activate_gates` to see the structural worst case, and measure trained models
+  without it to see what training actually opened.
+* **Unpadded ("valid") convolutions** (e.g. the wav2vec2 extractor) do not tile the input: the output grid has a non-integer ratio to the input, so the
+  reference point used for `lo`/`hi` is proportional, and `lo`/`hi` can look asymmetric even though `lo + hi` (the width) is exact. Tiling helpers
+  (`tiled_apply`) require whole-number ratios, so use them with padded models; chunk valid-conv models by hand.
 * Models must be in `eval()` mode (BatchNorm batch statistics otherwise mix samples).
-* Gradient influence is not the same as importance for the loss: a path with 3% of the gradient energy can still carry
-  information the decoder needs (global colour, tone).
+* Gradient influence is not the same as importance for the loss: a path with 3% of the gradient mass can still carry information the decoder needs.
 * Data-dependent structure (deformable ops, dynamic routing) has input-dependent support; the tool reports what it saw.
-* Tests take ~1.5 minutes on CPU (perturbation and position-map tests dominate).
+* The audio support for models with a global first-layer normalisation is "global"; look at the effective radius at both `power`s.
+* Tests take ~2 minutes on CPU (perturbation and position-map tests are marked `slow`).
 
 ## Related tools (not evaluated in depth)
 
@@ -123,36 +155,36 @@ Found by a quick search while drafting; check them before assuming overlap or ga
 [jotaf98/easy-receptive-fields-pytorch](https://github.com/jotaf98/easy-receptive-fields-pytorch)
 (analytical conv-layer RF calculators). First task of the next session should be to read their READMEs and state
 plainly what this project adds (candidates: attention/blocked/haloed models, per-direction asymmetry and alignment
-sweeps, decoders, gate handling, effective-vs-support, perturbation variant, per-layer hops, tiling-margin
-validation).
+sweeps, decoders, audio, gate handling, effective-vs-support and L1-vs-L2 mass, perturbation variant, per-layer hops, tiling-margin validation).
 
 ## Roadmap
 
-Richer analyses that this scaffold is meant to grow into:
-
-* Effective RF **across datasets** (distribution of eff. radius over many images, per token position, per class of content).
+* Effective RF **across datasets** (distribution of effective radius over many images/clips, per token position, per content class).
 * **Gradient vs perturbation vs attention-rollout** side-by-side, and where they disagree.
-* **Position maps**: effective radius / influence per token position to expose border effects and
-  register-like tokens (tokens whose reach or latent norm is out of line with neighbours; cf. Darcet et al.,
-  *Vision Transformers Need Registers*, arXiv 2309.16588).
-* Inverse view: **influence of each latent token on the whole output** (how much does token t matter to the reconstruction).
-* Layer-by-layer **effective** RF growth, and comparison against theoretical RF formulas (ship formula validators).
-* Tiling: seam-error maps, latent-space blending recommendations, margin recommender per model.
-* Plotting helpers (matplotlib): gradient maps, radius-vs-offset, position maps; MLflow logging helpers.
-* Benchmarks of popular tokenizers/autoencoders (CompressAI family, SD-style VAEs, VQGAN-like, others) as a table in this README.
+* **Position maps** (`position_map`, `plot_position_map` exist): effective radius / influence per token position to expose border effects and
+  register-like tokens (tokens whose reach or latent norm is out of line with neighbours; cf. Darcet et al., *Vision Transformers Need Registers*, arXiv 2309.16588).
+* Inverse view: **influence of each latent token on the whole output**.
+* Layer-by-layer **effective** RF growth for transformer stacks; compare with theoretical RF formulas (ship formula validators, e.g. a measured-vs-formula unit test).
+* Valid-conv-aware reference points and chunking helpers (speech models), including a margin recommender for wav2vec2-style chunked inference.
+* Spectrogram-input audio models (AST/BEATs-style: 2D with time and frequency axes), verified on real checkpoints (HuBERT, AVES, others), with real speech/animal-sound clips.
+* More plotting (radius-vs-offset, per-layer growth), MLflow logging helpers.
+* Benchmarks of popular tokenizers/autoencoders/speech encoders as a table in this README (trained checkpoints, not random init).
 
 ## Layout
 
 ```
 src/receptive_field_scope/
-  core.py        measure_receptive_field, RFResult, summarize
+  core.py        measure_receptive_field, RFResult, summarize  (N-d)
   gates.py       activate_gates
+  adapters.py    channels_last, waveform_model, hf_audio_layer
   layerwise.py   layerwise_receptive_field (per-layer hops via forward hooks)
   perturb.py     perturbation_receptive_field
-  sweeps.py      sweep_centers, grid_centers, position_map, over_images
-  tiling.py      tiled_apply, margin_sweep
-tests/           pytest, with exact-answer toy models (tests/toys.py)
-examples/        compressai_encoder.py
+  sweeps.py      sweep_centers, grid_centers, position_map, over_images / over_clips
+  tiling.py      tiled_apply, margin_sweep  (N-d)
+  plotting.py    overlay_heatmap, plot_waveform_rf, plot_position_map  (matplotlib, imported lazily)
+tests/           pytest; exact-answer toy models (tests/toys.py), 1D/3D, HuBERT checks (tests/test_audio_nd.py)
+examples/        compressai_encoder.py, hubert_receptive_field.py
+notebooks/       receptive_field_demo.ipynb
 ```
 
 ## Provenance
