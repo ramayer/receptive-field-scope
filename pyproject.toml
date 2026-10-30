@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "receptive-field-scope"
-version = "0.2.0"
-description = "Measure receptive fields of arbitrary PyTorch encoders/decoders (images, audio and video; gradient- and perturbation-based, support vs effective, per-direction, per-layer, alignment sweeps, tiling-margin validation)."
+version = "0.4.0"
+description = "Measure receptive fields of arbitrary PyTorch encoders/decoders (images, audio and video; gradient- and perturbation-based, support vs effective, per-direction, per-layer, alignment sweeps, tiling-margin validation) latent lesion studies and cut tests."
 readme = "README.md"
 license = "CC0-1.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["torch>=2.1"]
-keywords = ["audio", "HuBERT", "receptive field", "effective receptive field", "autoencoder", "tokenizer", "vision transformer", "tiling", "pytorch"]
+keywords = ["audio", "HuBERT", "receptive field", "effective receptive field", "autoencoder", "tokenizer", "vision transformer", "tiling", "latent lesion", "pytorch"]
 
 # pip-style extras (pip install "receptive-field-scope[plots]")
 [project.optional-dependencies]
@@ -29,4 +29,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]      # tests also work without installing the package; tests/toys.py is importable
-markers = ["slow: slower tests (perturbation sweeps, position maps) (deselect with 'pytest -m \"not slow\"')"] #
+markers = ["slow: slower tests (perturbation sweeps, position maps)"]

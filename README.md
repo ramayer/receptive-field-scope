@@ -4,7 +4,7 @@ Measure the receptive field of **any** PyTorch model (any `tensor -> tensor` cal
 tokenizers/autoencoders, windowed or haloed attention, strided/patchified stems, speech encoders (HuBERT/wav2vec2 style), and tiled/chunked inference.
 "scope" as in the *scope* of the receptive field, and as in a telescope you point at it.
 
-Status: **v0.2 draft** (written to bootstrap a project; see [Roadmap](#roadmap)). Tests: 25 pass (`pytest`; ~2 min, `-m "not slow"` is faster).
+Status: **v0.4 draft** (written to bootstrap a project; see [Roadmap](#roadmap)). Tests: 38 pass (`pytest`; ~1.5 min, `-m "not slow"` takes ~10 s).
 
 ## Why
 
@@ -106,10 +106,56 @@ GroupNorm over time (global support) has an effective radius of ~5250 samples at
 `perturbation_receptive_field(fn, ...)` adds noise to one input patch at a time and watches one output cell. It needs no gradients, so it works through
 quantizers, argmax and black-box models; it is coarser and slower (use `window=` to restrict the probed area).
 
+## Lesion studies (decoder side)
+
+`receptive_field_scope.lesion` damages latent tokens, decodes, and asks (a) how well the hole heals and (b) how far the damage spreads.
+It needs only `decode(latents)`, so it works for any tokenizer/codec.
+
+```python
+from receptive_field_scope import make_mask, lesion_latents, damage_profile, hole_sweep, lesion_importance_map
+
+y = model.g_a(images)                                       # CompressAI-style latents [N, C, h, w]
+mask = make_mask(y.shape[-2:], "lattice", step=2)           # the y[:, :, ::2, ::2] = fill experiment (True = lesioned)
+out = lesion_latents(model.g_s, y, mask, fill="neg", quantize=torch.round)
+prof = damage_profile(out["baseline"], out["lesioned"], mask, original=images)    # damage vs distance, inside and outside
+```
+
+* **Fills are a family, not zero.** A zero latent is not "missing": some decoders turn it into a flat patch, others into texture. Available:
+  `zero`, `mean`, `neg` (reflect through the channel centre, `2c - y`: same magnitude, opposite content; `center=` accepts e.g. hyperprior means),
+  `neg0` (literal `-y`), `noise`, `shuffle` (real latents from the wrong place), `other` (another image), `neighbor` (latent interpolation).
+  Results that agree across fills are properties of the decoder; results that vary are properties of the fill.
+* **Fill statistics are a confound.** `mean`, `neg` (default centre) and `noise` use the per-channel mean/std of *this image's* latents, i.e. a global image statistic, so a
+  noise-filled hole can inherit the image's palette without any global state in the decoder. Pass `stats=` (latents of another image or a pooled set) to control for it, and use
+  `fill_color_attribution` (does the filled colour follow the local surround, the global mean, or the true content?) and `palette_distance` to quantify palette effects.
+* **Compare against the un-lesioned *quantized* decode** (`baseline`), not the original: the quantization floor is not damage.
+* **`damage_profile`**: collateral damage versus distance (a strictly local decoder drops to *exactly zero* beyond its reach) and healing versus depth inside the hole.
+* **`hole_sweep`**: how large a hole can be interpolated.
+* **`lesion_importance_map`**: lesion every token alone and measure damage *far* away. A token that changes distant pixels carries global information
+  (the decoder-side register detector; uniform-background tokens are the suspects).
+* **Texture vs smooth continuation**: `harmonic_fill` (Laplace diffusion, no new texture) and `radial_power` / `highfreq_ratio` let you check whether a filled hole carries
+  high-frequency content from the neighbouring latents or is just a smooth continuation. Decoders also ring: look at the crops as well as the spectrum.
+
+## Cut tests: tiling padding and "did I chop off a register?"
+
+Lesion profiles measure damage around a hole. For tiling the practical questions are different, and `cut_profile` answers them: remove or replace a band or corner of the
+input and measure how far into the *retained* region the output changes (encoders: pass the image; decoders: pass the latents; distances in token cells).
+
+```python
+from receptive_field_scope import cut_profile, margin_needed
+p_crop = cut_profile(model.encoder, image, (0, 0, 0, 6), mode="crop")        # right band of 6 tokens removed
+p_repl = cut_profile(model.encoder, image, mode="replace", replace_mask=corner_mask, replacement="noise")
+margin_needed(p_crop, rel_tol=1e-6)      # tokens of context to keep beyond the tile edge (None = the error never settles)
+```
+
+* **`crop`**: content removed *and* the border moved (zero padding, absolute positions). **`replace`**: the band keeps its place and only its content changes.
+* Far error under `replace` = content-borne long-range dependence (register-like). Far error under `crop` but not `replace` = a border/position effect.
+* `margin_needed` returning `None` means the output never settled within the profile: either a non-local dependence or a profile too short to see the reach.
+
 ## Demos
 
 * `notebooks/receptive_field_demo.ipynb` (executed, outputs included): heatmaps of the receptive field overlaid on an image for a local-conv, a blocked-mixing
   (haloed-attention-like) and a global-attention toy tokenizer; block-alignment asymmetry; image dependence; per-layer hops; tile-margin sweep; a waveform.
+* `notebooks/lesion_demo.ipynb` (executed with a TOY autoencoder because pretrained CompressAI weights could not be downloaded in the sandbox; it uses real CompressAI weights automatically when they can be fetched): lattice lesions with 7 fills, damage-vs-distance (block hole), hole sweep, tiling-margin / register cut tests, texture-vs-smooth test, register hunt.
 * `examples/compressai_encoder.py`: off-the-shelf encoder (CompressAI `g_a`, random init).
 * `examples/hubert_receptive_field.py`: Hugging Face HuBERT (random init): conv extractor = 400 samples/25 ms at stride 320; global support above it.
 
@@ -159,6 +205,15 @@ sweeps, decoders, audio, gate handling, effective-vs-support and L1-vs-L2 mass, 
 
 ## Roadmap
 
+Done so far: lesion studies and cut tests. Near-term, in rough priority order (motivation: large-image tiled generation / infinite zoom with VAR/GRN-style generators: the decoder's reach and the *stationarity* of the latent distribution matter more than the encoder's):
+
+* **Paired-context probe** (encoder side): paste identical pixels (e.g. a saturated-white sclera vs a white border) into different contexts and measure the latent difference versus *depth inside the region* (beyond the structural support a strictly local model must give exactly zero), plus a linear probe for context class.
+* **Far-field maps** for encoders: gradient mass outside the token's near region as a map and a leakage curve L(m) = mass beyond half-width m; **context-swap** maps (replace everything outside the near region, measure relative latent change per token); **constant-image probe** (latent structure of a flat white/black image: position/border/global-state signal).
+* **Stationarity checks**: translation equivariance (shift by whole patches -> latents shift identically) and a border-distance curve (latent change vs distance to the crop border, separating zero-padding position cues from long-range content influence).
+* Lesion study on real checkpoints (bmshj2018, mbt2018, cheng2020-attn) and on MAE-on vs MAE-off tokenizers.
+
+Longer-term:
+
 * Effective RF **across datasets** (distribution of effective radius over many images/clips, per token position, per content class).
 * **Gradient vs perturbation vs attention-rollout** side-by-side, and where they disagree.
 * **Position maps** (`position_map`, `plot_position_map` exist): effective radius / influence per token position to expose border effects and
@@ -181,10 +236,12 @@ src/receptive_field_scope/
   perturb.py     perturbation_receptive_field
   sweeps.py      sweep_centers, grid_centers, position_map, over_images / over_clips
   tiling.py      tiled_apply, margin_sweep  (N-d)
+  cut.py         cut_profile, margin_needed (crop/replace tests: tiling margins and register checks)
+  lesion.py      make_mask, apply_fill, lesion_latents, damage_profile, hole_sweep, lesion_importance_map, harmonic_fill, radial_power
   plotting.py    overlay_heatmap, plot_waveform_rf, plot_position_map  (matplotlib, imported lazily)
 tests/           pytest; exact-answer toy models (tests/toys.py), 1D/3D, HuBERT checks (tests/test_audio_nd.py)
-examples/        compressai_encoder.py, hubert_receptive_field.py
-notebooks/       receptive_field_demo.ipynb
+examples/        compressai_encoder.py, hubert_receptive_field.py, tiny_autoencoder.py
+notebooks/       receptive_field_demo.ipynb, lesion_demo.ipynb
 ```
 
 ## Provenance
